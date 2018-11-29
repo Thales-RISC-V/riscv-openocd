@@ -30,20 +30,21 @@
 #define DMI_DATA1 (DMI_DATA0 + 1)
 #define DMI_PROGBUF1 (DMI_PROGBUF0 + 1)
 
-static void riscv013_on_step_or_resume(struct target *target, bool step);
+static int riscv013_on_step_or_resume(struct target *target, bool step);
 static int riscv013_step_or_resume_current_hart(struct target *target, bool step);
 static void riscv013_clear_abstract_error(struct target *target);
 
 /* Implementations of the functions in riscv_info_t. */
-static riscv_reg_t riscv013_get_register(struct target *target, int hartid, int regid);
+static int riscv013_get_register(struct target *target,
+		riscv_reg_t *value, int hid, int rid);
 static int riscv013_set_register(struct target *target, int hartid, int regid, uint64_t value);
 static void riscv013_select_current_hart(struct target *target);
 static int riscv013_halt_current_hart(struct target *target);
 static int riscv013_resume_current_hart(struct target *target);
 static int riscv013_step_current_hart(struct target *target);
-static void riscv013_on_halt(struct target *target);
-static void riscv013_on_step(struct target *target);
-static void riscv013_on_resume(struct target *target);
+static int riscv013_on_halt(struct target *target);
+static int riscv013_on_step(struct target *target);
+static int riscv013_on_resume(struct target *target);
 static bool riscv013_is_halted(struct target *target);
 static enum riscv_halt_reason riscv013_halt_reason(struct target *target);
 static int riscv013_write_debug_buffer(struct target *target, unsigned index,
@@ -141,10 +142,6 @@ typedef struct {
 	unsigned datacount;
 	/* Number of words in the Program Buffer. */
 	unsigned progbufsize;
-	/* The value that mstatus actually has on the target right now. This is not
-	 * the value we present to the user. That one may be stored in the
-	 * reg_cache. */
-	uint64_t mstatus_actual;
 
 	yes_no_maybe_t progbuf_writable;
 	/* We only need the address so that we know the alignment of the buffer. */
@@ -182,7 +179,22 @@ typedef struct {
 	uint8_t datasize;
 	uint8_t dataaccess;
 	int16_t dataaddr;
+
+	/* The width of the hartsel field. */
+	unsigned hartsellen;
 } riscv013_info_t;
+
+static riscv013_info_t *get_info(const struct target *target)
+{
+	riscv_info_t *info = (riscv_info_t *) target->arch_info;
+	return (riscv013_info_t *) info->version_specific;
+}
+
+static uint32_t hartsel_mask(const struct target *target)
+{
+	RISCV013_INFO(info);
+	return ((1L<<info->hartsellen)-1) << DMI_DMCONTROL_HARTSEL_OFFSET;
+}
 
 static void decode_dmi(char *text, unsigned address, unsigned data)
 {
@@ -195,7 +207,7 @@ static void decode_dmi(char *text, unsigned address, unsigned data)
 		{ DMI_DMCONTROL, DMI_DMCONTROL_RESUMEREQ, "resumereq" },
 		{ DMI_DMCONTROL, DMI_DMCONTROL_HARTRESET, "hartreset" },
 		{ DMI_DMCONTROL, DMI_DMCONTROL_HASEL, "hasel" },
-		{ DMI_DMCONTROL, DMI_DMCONTROL_HARTSEL, "hartsel" },
+		{ DMI_DMCONTROL, ((1L<<10)-1) << DMI_DMCONTROL_HARTSEL_OFFSET, "hartsel" },
 		{ DMI_DMCONTROL, DMI_DMCONTROL_NDMRESET, "ndmreset" },
 		{ DMI_DMCONTROL, DMI_DMCONTROL_DMACTIVE, "dmactive" },
 
@@ -278,12 +290,6 @@ static void dump_field(const struct scan_field *field)
 	}
 }
 
-static riscv013_info_t *get_info(const struct target *target)
-{
-	riscv_info_t *info = (riscv_info_t *) target->arch_info;
-	return (riscv013_info_t *) info->version_specific;
-}
-
 /*** Utility functions. ***/
 
 static void select_dmi(struct target *target)
@@ -334,7 +340,7 @@ static void increase_dmi_busy_delay(struct target *target)
 {
 	riscv013_info_t *info = get_info(target);
 	info->dmi_busy_delay += info->dmi_busy_delay / 10 + 1;
-	LOG_INFO("dtmcontrol_idle=%d, dmi_busy_delay=%d, ac_busy_delay=%d",
+	LOG_DEBUG("dtmcontrol_idle=%d, dmi_busy_delay=%d, ac_busy_delay=%d",
 			info->dtmcontrol_idle, info->dmi_busy_delay,
 			info->ac_busy_delay);
 
@@ -346,7 +352,7 @@ static void increase_dmi_busy_delay(struct target *target)
  * run-test/idle cycles may be required.
  */
 static dmi_status_t dmi_scan(struct target *target, uint16_t *address_in,
-		uint64_t *data_in, dmi_op_t op, uint16_t address_out, uint64_t data_out,
+		uint32_t *data_in, dmi_op_t op, uint16_t address_out, uint32_t data_out,
 		bool exec)
 {
 	riscv013_info_t *info = get_info(target);
@@ -360,9 +366,9 @@ static dmi_status_t dmi_scan(struct target *target, uint16_t *address_in,
 
 	assert(info->abits != 0);
 
-	buf_set_u64(out, DTM_DMI_OP_OFFSET, DTM_DMI_OP_LENGTH, op);
-	buf_set_u64(out, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH, data_out);
-	buf_set_u64(out, DTM_DMI_ADDRESS_OFFSET, info->abits, address_out);
+	buf_set_u32(out, DTM_DMI_OP_OFFSET, DTM_DMI_OP_LENGTH, op);
+	buf_set_u32(out, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH, data_out);
+	buf_set_u32(out, DTM_DMI_ADDRESS_OFFSET, info->abits, address_out);
 
 	/* Assume dbus is already selected. */
 	jtag_add_dr_scan(target->tap, 1, &field, TAP_IDLE);
@@ -381,7 +387,7 @@ static dmi_status_t dmi_scan(struct target *target, uint16_t *address_in,
 	}
 
 	if (data_in)
-		*data_in = buf_get_u64(in, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH);
+		*data_in = buf_get_u32(in, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH);
 
 	if (address_in)
 		*address_in = buf_get_u32(in, DTM_DMI_ADDRESS_OFFSET, info->abits);
@@ -391,7 +397,7 @@ static dmi_status_t dmi_scan(struct target *target, uint16_t *address_in,
 	return buf_get_u32(in, DTM_DMI_OP_OFFSET, DTM_DMI_OP_LENGTH);
 }
 
-static uint64_t dmi_read(struct target *target, uint16_t address)
+static uint32_t dmi_read(struct target *target, uint16_t address)
 {
 	select_dmi(target);
 
@@ -418,13 +424,13 @@ static uint64_t dmi_read(struct target *target, uint16_t address)
 
 	if (status != DMI_STATUS_SUCCESS) {
 		LOG_ERROR("Failed read from 0x%x; status=%d", address, status);
-		return ~0ULL;
+		return ~0;
 	}
 
 	/* This second loop ensures that we got the read
 	 * data back. Note that NOP can result in a 'busy' result as well, but
 	 * that would be noticed on the next DMI access we do. */
-	uint64_t value;
+	uint32_t value;
 	for (i = 0; i < 256; i++) {
 		status = dmi_scan(target, &address_in, &value, DMI_OP_NOP, address, 0,
 				false);
@@ -439,9 +445,13 @@ static uint64_t dmi_read(struct target *target, uint16_t address)
 	}
 
 	if (status != DMI_STATUS_SUCCESS) {
-		LOG_ERROR("Failed read (NOP) from 0x%x; value=0x%" PRIx64 ", status=%d",
-				address, value, status);
-		return ~0ULL;
+		if (status == DMI_STATUS_FAILED) {
+			LOG_ERROR("Failed read (NOP) from 0x%x; status=%d", address, status);
+		} else {
+			LOG_ERROR("Failed read (NOP) from 0x%x; value=0x%x, status=%d",
+					address, value, status);
+		}
+		return ~0;
 	}
 
 	return value;
@@ -500,7 +510,7 @@ static void increase_ac_busy_delay(struct target *target)
 {
 	riscv013_info_t *info = get_info(target);
 	info->ac_busy_delay += info->ac_busy_delay / 10 + 1;
-	LOG_INFO("dtmcontrol_idle=%d, dmi_busy_delay=%d, ac_busy_delay=%d",
+	LOG_DEBUG("dtmcontrol_idle=%d, dmi_busy_delay=%d, ac_busy_delay=%d",
 			info->dtmcontrol_idle, info->dmi_busy_delay,
 			info->ac_busy_delay);
 }
@@ -565,8 +575,8 @@ static int execute_abstract_command(struct target *target, uint32_t command)
 	dmi_write(target, DMI_COMMAND, command);
 
 	{
-		uint32_t dmstatus = 0;
-		wait_for_idle(target, &dmstatus);
+		uint32_t abstractcs = 0;
+		wait_for_idle(target, &abstractcs);
 	}
 
 	uint32_t cs = dmi_read(target, DMI_ABSTRACTCS);
@@ -988,8 +998,6 @@ static int register_read_direct(struct target *target, uint64_t *value, uint32_t
 	if (result != ERROR_OK) {
 		assert(number != GDB_REGNO_S0);
 
-		result = ERROR_OK;
-
 		struct riscv_program program;
 		riscv_program_init(&program, target);
 
@@ -1002,8 +1010,15 @@ static int register_read_direct(struct target *target, uint64_t *value, uint32_t
 
 		/* Write program to move data into s0. */
 
+		uint64_t mstatus;
 		if (number >= GDB_REGNO_FPR0 && number <= GDB_REGNO_FPR31) {
-			/* TODO: Possibly set F in mstatus. */
+			if (register_read_direct(target, &mstatus, GDB_REGNO_MSTATUS) != ERROR_OK)
+				return ERROR_FAIL;
+			if ((mstatus & MSTATUS_FS) == 0)
+				if (register_write_direct(target, GDB_REGNO_MSTATUS,
+							set_field(mstatus, MSTATUS_FS, 1)) != ERROR_OK)
+					return ERROR_FAIL;
+
 			if (riscv_supports_extension(target, 'D') && riscv_xlen(target) < 64) {
 				/* There are no instructions to move all the bits from a
 				 * register, so we need to use some scratch RAM. */
@@ -1040,6 +1055,11 @@ static int register_read_direct(struct target *target, uint64_t *value, uint32_t
 			if (register_read_direct(target, value, GDB_REGNO_S0) != ERROR_OK)
 				return ERROR_FAIL;
 		}
+
+		if (number >= GDB_REGNO_FPR0 && number <= GDB_REGNO_FPR31 &&
+				(mstatus & MSTATUS_FS) == 0)
+			if (register_write_direct(target, GDB_REGNO_MSTATUS, mstatus) != ERROR_OK)
+				return ERROR_FAIL;
 
 		/* Restore S0. */
 		if (register_write_direct(target, GDB_REGNO_S0, s0) != ERROR_OK)
@@ -1144,19 +1164,10 @@ static int examine(struct target *target)
 	}
 
 	/* Reset the Debug Module. */
-	dmi_write(target, DMI_DMCONTROL, 0);
-	dmi_write(target, DMI_DMCONTROL, DMI_DMCONTROL_DMACTIVE);
+	uint32_t max_hartsel_mask = ((1L<<10)-1) << DMI_DMCONTROL_HARTSEL_OFFSET;
+	dmi_write(target, DMI_DMCONTROL, max_hartsel_mask);
+	dmi_write(target, DMI_DMCONTROL, max_hartsel_mask | DMI_DMCONTROL_DMACTIVE);
 	uint32_t dmcontrol = dmi_read(target, DMI_DMCONTROL);
-
-	uint32_t hartinfo = dmi_read(target, DMI_HARTINFO);
-
-	LOG_DEBUG("dmcontrol: 0x%08x", dmcontrol);
-	LOG_DEBUG("dmstatus:  0x%08x", dmstatus);
-	LOG_DEBUG("hartinfo:  0x%08x", hartinfo);
-
-	info->datasize = get_field(hartinfo, DMI_HARTINFO_DATASIZE);
-	info->dataaccess = get_field(hartinfo, DMI_HARTINFO_DATAACCESS);
-	info->dataaddr = get_field(hartinfo, DMI_HARTINFO_DATAADDR);
 
 	if (!get_field(dmcontrol, DMI_DMCONTROL_DMACTIVE)) {
 		LOG_ERROR("Debug Module did not become active. dmcontrol=0x%x",
@@ -1164,19 +1175,23 @@ static int examine(struct target *target)
 		return ERROR_FAIL;
 	}
 
+	uint32_t hartsel = get_field(dmcontrol, max_hartsel_mask);
+	info->hartsellen = 0;
+	while (hartsel & 1) {
+		info->hartsellen++;
+		hartsel >>= 1;
+	}
+	LOG_DEBUG("hartsellen=%d", info->hartsellen);
+
+	uint32_t hartinfo = dmi_read(target, DMI_HARTINFO);
+
+	info->datasize = get_field(hartinfo, DMI_HARTINFO_DATASIZE);
+	info->dataaccess = get_field(hartinfo, DMI_HARTINFO_DATAACCESS);
+	info->dataaddr = get_field(hartinfo, DMI_HARTINFO_DATAADDR);
+
 	if (!get_field(dmstatus, DMI_DMSTATUS_AUTHENTICATED)) {
 		LOG_ERROR("Authentication required by RISC-V core but not "
 				"supported by OpenOCD. dmcontrol=0x%x", dmcontrol);
-		return ERROR_FAIL;
-	}
-
-	if (get_field(dmstatus, DMI_DMSTATUS_ANYUNAVAIL)) {
-		LOG_ERROR("The hart is unavailable.");
-		return ERROR_FAIL;
-	}
-
-	if (get_field(dmstatus, DMI_DMSTATUS_ANYNONEXISTENT)) {
-		LOG_ERROR("The hart doesn't exist.");
 		return ERROR_FAIL;
 	}
 
@@ -1185,13 +1200,14 @@ static int examine(struct target *target)
 	info->datacount = get_field(abstractcs, DMI_ABSTRACTCS_DATACOUNT);
 	info->progbufsize = get_field(abstractcs, DMI_ABSTRACTCS_PROGBUFSIZE);
 
-	/* Before doing anything else we must first enumerate the harts. */
 	RISCV_INFO(r);
 	r->impebreak = get_field(dmstatus, DMI_DMSTATUS_IMPEBREAK);
 
+	/* Before doing anything else we must first enumerate the harts. */
+
 	/* Don't call any riscv_* functions until after we've counted the number of
 	 * cores and initialized registers. */
-	for (int i = 0; i < RISCV_MAX_HARTS; ++i) {
+	for (int i = 0; i < MIN(RISCV_MAX_HARTS, 1 << info->hartsellen); ++i) {
 		if (!riscv_rtos_enabled(target) && i != target->coreid)
 			continue;
 
@@ -1203,8 +1219,12 @@ static int examine(struct target *target)
 			break;
 		r->hart_count = i + 1;
 
-		if (!riscv_is_halted(target))
-			riscv013_halt_current_hart(target);
+		if (!riscv_is_halted(target)) {
+			if (riscv013_halt_current_hart(target) != ERROR_OK) {
+				LOG_ERROR("Fatal: Hart %d failed to halt during examine()", i);
+				return ERROR_FAIL;
+			}
+		}
 
 		/* Without knowing anything else we can at least mess with the
 		 * program buffer. */
@@ -1216,7 +1236,10 @@ static int examine(struct target *target)
 		else
 			r->xlen[i] = 32;
 
-		register_read_direct(target, &r->misa, GDB_REGNO_MISA);
+		if (register_read_direct(target, &r->misa, GDB_REGNO_MISA)) {
+			LOG_ERROR("Fatal: Failed to read MISA from hart %d.", i);
+			return ERROR_FAIL;
+		}
 
 		/* Now init registers based on what we discovered. */
 		if (riscv_init_registers(target) != ERROR_OK)
@@ -1229,6 +1252,11 @@ static int examine(struct target *target)
 	}
 
 	LOG_DEBUG("Enumerated %d harts", r->hart_count);
+
+	if (r->hart_count == 0) {
+		LOG_ERROR("No harts found!");
+		return ERROR_FAIL;
+	}
 
 	/* Then we check the number of triggers availiable to each hart. */
 	riscv_enumerate_triggers(target);
@@ -1279,7 +1307,7 @@ static int assert_reset(struct target *target)
 			if (!riscv_hart_enabled(target, i))
 				continue;
 
-			control = set_field(control_base, DMI_DMCONTROL_HARTSEL, i);
+			control = set_field(control_base, hartsel_mask(target), i);
 			control = set_field(control, DMI_DMCONTROL_HALTREQ,
 					target->reset_halt ? 1 : 0);
 			dmi_write(target, DMI_DMCONTROL, control);
@@ -1290,7 +1318,7 @@ static int assert_reset(struct target *target)
 
 	} else {
 		/* Reset just this hart. */
-		uint32_t control = set_field(control_base, DMI_DMCONTROL_HARTSEL,
+		uint32_t control = set_field(control_base, hartsel_mask(target),
 				r->current_hartid);
 		control = set_field(control, DMI_DMCONTROL_HALTREQ,
 				target->reset_halt ? 1 : 0);
@@ -1324,7 +1352,7 @@ static int deassert_reset(struct target *target)
 	/* Clear the reset, but make sure haltreq is still set */
 	uint32_t control = 0;
 	control = set_field(control, DMI_DMCONTROL_HALTREQ, target->reset_halt ? 1 : 0);
-	control = set_field(control, DMI_DMCONTROL_HARTSEL, r->current_hartid);
+	control = set_field(control, hartsel_mask(target), r->current_hartid);
 	control = set_field(control, DMI_DMCONTROL_DMACTIVE, 1);
 	dmi_write(target, DMI_DMCONTROL, control);
 
@@ -1406,6 +1434,19 @@ static int execute_fence(struct target *target)
 	if (result != ERROR_OK)
 		LOG_ERROR("Unable to execute fence");
 	return result;
+}
+
+static void log_memory_access(target_addr_t address, uint64_t value,
+		unsigned size_bytes, bool read)
+{
+	if (debug_level < LOG_LVL_DEBUG)
+		return;
+
+	char fmt[80];
+	sprintf(fmt, "M[0x%" TARGET_PRIxADDR "] %ss 0x%%0%d" PRIx64,
+			address, read ? "read" : "write", size_bytes * 2);
+	value &= (((uint64_t) 0x1) << (size_bytes * 8)) - 1;
+	LOG_DEBUG(fmt, value);
 }
 
 /**
@@ -1603,8 +1644,7 @@ static int read_memory(struct target *target, target_addr_t address,
 			uint64_t dmi_out = riscv_batch_get_dmi_read(batch, i);
 			uint32_t value = get_field(dmi_out, DTM_DMI_DATA);
 			write_to_buf(buffer + offset, value, size);
-			LOG_DEBUG("M[0x%" TARGET_PRIxADDR "] reads 0x%08x", receive_addr,
-					value);
+			log_memory_access(receive_addr, value, size, true);
 
 			receive_addr += size;
 		}
@@ -1613,8 +1653,7 @@ static int read_memory(struct target *target, target_addr_t address,
 		if (cmderr == CMDERR_BUSY) {
 			riscv_addr_t offset = receive_addr - address;
 			write_to_buf(buffer + offset, dmi_data0, size);
-			LOG_DEBUG("M[0x%" TARGET_PRIxADDR "] reads 0x%08x", receive_addr,
-					dmi_data0);
+			log_memory_access(receive_addr, dmi_data0, size, true);
 			read_addr += size;
 			receive_addr += size;
 		}
@@ -1626,7 +1665,7 @@ static int read_memory(struct target *target, target_addr_t address,
 		/* Read the penultimate word. */
 		uint64_t value = dmi_read(target, DMI_DATA0);
 		write_to_buf(buffer + receive_addr - address, value, size);
-		LOG_DEBUG("M[0x%" TARGET_PRIxADDR "] reads 0x%" PRIx64, receive_addr, value);
+		log_memory_access(receive_addr, value, size, true);
 		receive_addr += size;
 	}
 
@@ -1636,8 +1675,7 @@ static int read_memory(struct target *target, target_addr_t address,
 	if (result != ERROR_OK)
 		goto error;
 	write_to_buf(buffer + receive_addr - address, value, size);
-	LOG_DEBUG("M[0x%" TARGET_PRIxADDR "] reads 0x%" PRIx64, receive_addr, value);
-	receive_addr += size;
+	log_memory_access(receive_addr, value, size, true);
 
 	riscv_set_register(target, GDB_REGNO_S0, s0);
 	riscv_set_register(target, GDB_REGNO_S1, s1);
@@ -1739,7 +1777,7 @@ static int write_memory(struct target *target, target_addr_t address,
 					goto error;
 			}
 
-			LOG_DEBUG("M[0x%08" PRIx64 "] writes 0x%08x", address + offset, value);
+			log_memory_access(address + offset, value, size, false);
 			cur_addr += size;
 
 			if (setup_needed) {
@@ -1855,36 +1893,32 @@ struct target_type riscv013_target = {
 };
 
 /*** 0.13-specific implementations of various RISC-V helper functions. ***/
-static riscv_reg_t riscv013_get_register(struct target *target, int hid, int rid)
+static int riscv013_get_register(struct target *target,
+		riscv_reg_t *value, int hid, int rid)
 {
 	LOG_DEBUG("reading register %s on hart %d", gdb_regno_name(rid), hid);
 
 	riscv_set_current_hartid(target, hid);
 
-	uint64_t out;
-	riscv013_info_t *info = get_info(target);
-
+	int result = ERROR_OK;
 	if (rid <= GDB_REGNO_XPR31) {
-		register_read_direct(target, &out, rid);
+		result = register_read_direct(target, value, rid);
 	} else if (rid == GDB_REGNO_PC) {
-		register_read_direct(target, &out, GDB_REGNO_DPC);
-		LOG_DEBUG("read PC from DPC: 0x%016" PRIx64, out);
+		result = register_read_direct(target, value, GDB_REGNO_DPC);
+		LOG_DEBUG("read PC from DPC: 0x%016" PRIx64, *value);
 	} else if (rid == GDB_REGNO_PRIV) {
 		uint64_t dcsr;
-		register_read_direct(target, &dcsr, GDB_REGNO_DCSR);
-		buf_set_u64((unsigned char *)&out, 0, 8, get_field(dcsr, CSR_DCSR_PRV));
+		result = register_read_direct(target, &dcsr, GDB_REGNO_DCSR);
+		buf_set_u64((unsigned char *)value, 0, 8, get_field(dcsr, CSR_DCSR_PRV));
 	} else {
-		int result = register_read_direct(target, &out, rid);
+		result = register_read_direct(target, value, rid);
 		if (result != ERROR_OK) {
-			LOG_ERROR("Unable to read register %d", rid);
-			out = -1;
+			LOG_ERROR("Unable to read %s", gdb_regno_name(rid));
+			*value = -1;
 		}
-
-		if (rid == GDB_REGNO_MSTATUS)
-			info->mstatus_actual = out;
 	}
 
-	return out;
+	return result;
 }
 
 static int riscv013_set_register(struct target *target, int hid, int rid, uint64_t value)
@@ -1924,7 +1958,7 @@ static void riscv013_select_current_hart(struct target *target)
 	RISCV_INFO(r);
 
 	uint64_t dmcontrol = dmi_read(target, DMI_DMCONTROL);
-	dmcontrol = set_field(dmcontrol, DMI_DMCONTROL_HARTSEL, r->current_hartid);
+	dmcontrol = set_field(dmcontrol, hartsel_mask(target), r->current_hartid);
 	dmi_write(target, DMI_DMCONTROL, dmcontrol);
 }
 
@@ -1969,18 +2003,19 @@ static int riscv013_step_current_hart(struct target *target)
 	return riscv013_step_or_resume_current_hart(target, true);
 }
 
-static void riscv013_on_resume(struct target *target)
+static int riscv013_on_resume(struct target *target)
 {
 	return riscv013_on_step_or_resume(target, false);
 }
 
-static void riscv013_on_step(struct target *target)
+static int riscv013_on_step(struct target *target)
 {
 	return riscv013_on_step_or_resume(target, true);
 }
 
-static void riscv013_on_halt(struct target *target)
+static int riscv013_on_halt(struct target *target)
 {
+	return ERROR_OK;
 }
 
 static bool riscv013_is_halted(struct target *target)
@@ -1995,7 +2030,11 @@ static bool riscv013_is_halted(struct target *target)
 
 static enum riscv_halt_reason riscv013_halt_reason(struct target *target)
 {
-	uint64_t dcsr = riscv_get_register(target, GDB_REGNO_DCSR);
+	riscv_reg_t dcsr;
+	int result = register_read_direct(target, &dcsr, GDB_REGNO_DCSR);
+	if (result != ERROR_OK)
+		return RISCV_HALT_UNKNOWN;
+
 	switch (get_field(dcsr, CSR_DCSR_CAUSE)) {
 	case CSR_DCSR_CAUSE_SWBP:
 	case CSR_DCSR_CAUSE_TRIGGER:
@@ -2064,7 +2103,7 @@ int riscv013_dmi_write_u64_bits(struct target *target)
 }
 
 /* Helper Functions. */
-static void riscv013_on_step_or_resume(struct target *target, bool step)
+static int riscv013_on_step_or_resume(struct target *target, bool step)
 {
 	struct riscv_program program;
 	riscv_program_init(&program, target);
@@ -2073,12 +2112,15 @@ static void riscv013_on_step_or_resume(struct target *target, bool step)
 		LOG_ERROR("Unable to execute fence.i");
 
 	/* We want to twiddle some bits in the debug CSR so debugging works. */
-	uint64_t dcsr = riscv_get_register(target, GDB_REGNO_DCSR);
+	riscv_reg_t dcsr;
+	int result = register_read_direct(target, &dcsr, GDB_REGNO_DCSR);
+	if (result != ERROR_OK)
+		return result;
 	dcsr = set_field(dcsr, CSR_DCSR_STEP, step);
 	dcsr = set_field(dcsr, CSR_DCSR_EBREAKM, 1);
 	dcsr = set_field(dcsr, CSR_DCSR_EBREAKS, 1);
 	dcsr = set_field(dcsr, CSR_DCSR_EBREAKU, 1);
-	riscv_set_register(target, GDB_REGNO_DCSR, dcsr);
+	return riscv_set_register(target, GDB_REGNO_DCSR, dcsr);
 }
 
 static int riscv013_step_or_resume_current_hart(struct target *target, bool step)

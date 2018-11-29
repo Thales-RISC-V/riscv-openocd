@@ -465,8 +465,9 @@ static int slow_fespi_write_buffer(struct flash_bank *bank,
  * Here's the source for the algorithm.
  * You can turn it into the array below using:
 	sed -n '/ALGO_START$/,/ALGO_END/ p' fespi.c | \
-		riscv32-unknown-elf-gcc -x assembler-with-cpp - -nostdlib -nostartfiles -o tmp.o && \
-		riscv32-unknown-elf-objcopy -O binary tmp.o algorithm.bin && \
+		riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -x \
+		assembler-with-cpp - -nostdlib -nostartfiles -o tmp.o && \
+		riscv64-unknown-elf-objcopy -O binary tmp.o algorithm.bin && \
 		xxd -i algorithm.bin
 
 // ALGO_START
@@ -795,7 +796,6 @@ static int steps_execute(struct algorithm_steps *as,
 	struct target *target = bank->target;
 	struct fespi_flash_bank *fespi_info = bank->driver_priv;
 	uint32_t ctrl_base = fespi_info->ctrl_base;
-	uint8_t *data_buf = malloc(data_wa->size);
 	int xlen = riscv_xlen(target);
 
 	struct reg_param reg_params[2];
@@ -805,9 +805,11 @@ static int steps_execute(struct algorithm_steps *as,
 	buf_set_u64(reg_params[1].value, 0, xlen, data_wa->address);
 	while (!as_empty(as)) {
 		keep_alive();
+		uint8_t *data_buf = malloc(data_wa->size);
 		unsigned bytes = as_compile(as, data_buf, data_wa->size);
 		int retval = target_write_buffer(target, data_wa->address, bytes,
 				data_buf);
+		free(data_buf);
 		if (retval != ERROR_OK) {
 			LOG_ERROR("Failed to write data to 0x%" TARGET_PRIxADDR ": %d",
 					data_wa->address, retval);

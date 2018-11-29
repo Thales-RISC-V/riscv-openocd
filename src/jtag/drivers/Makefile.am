@@ -147,6 +147,9 @@ endif
 if OPENJTAG
 DRIVERFILES += %D%/openjtag.c
 endif
+if SIMPLELINK
+DRIVERFILES += %D%/simplelink.c
+endif
 if CMSIS_DAP
 DRIVERFILES += %D%/cmsis_dap_usb.c
 endif
